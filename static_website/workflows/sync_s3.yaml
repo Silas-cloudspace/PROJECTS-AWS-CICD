@@ -1,0 +1,29 @@
+# This is done to automatically update any changes you do
+# to your website when working in the "index.html" file
+
+name: Sync files to S3 Bucket
+
+on:
+  workflow_run:
+    workflows: ["Deploy Infrastructure"]
+    types:
+      - completed
+
+jobs:
+  sync_s3:
+    name: Sync files to S3 Bucket
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@master
+
+      - uses: jakejarvis/s3-sync-action@master
+        with:
+          args: --delete --exclude '.DS_Store'
+      
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_S3_BUCKET: "your bucket name"
+          AWS_REGION: "your region"
+          SOURCE_DIR: "./website"
