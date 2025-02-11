@@ -1,0 +1,312 @@
+name: Deploy Infrastructure and Application
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  TERRAFORM_ACTION: "apply" # Replace it with "destroy" to destroy the infrastructure
+  ECR_REPOSITORY_NAME: "cea-projects-sharing-ecr"
+  IMAGE_TAG: "latest"  
+
+jobs:
+  build-and-push-docker:
+    name: Build and Push Docker Image to ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Create ECR Repository (if not exists)
+        run: |
+          aws ecr describe-repositories --repository-names $ECR_REPOSITORY_NAME || \
+          aws ecr create-repository --repository-name $ECR_REPOSITORY_NAME --region $AWS_REGION
+
+      - name: Authenticate Docker with ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | \
+          docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build Docker Image
+        run: docker build -t $ECR_REPOSITORY_NAME:$IMAGE_TAG ./backend
+
+      - name: Tag Docker Image for ECR
+        run: docker tag $ECR_REPOSITORY_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG
+
+      - name: Push Image to ECR
+        run: docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY_NAME:$IMAGE_TAG
+
+  remote-backend:
+    name: Remote Backend Setup
+    runs-on: ubuntu-latest
+    needs: build-and-push-docker
+    defaults:
+      run:
+        working-directory: platform/remote_backend
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform Backend
+        run: terraform init
+      
+      - name: Terraform Apply
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: terraform apply -auto-approve || echo "Ignoring existing resources error"
+
+      - name: Terraform Destroy
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: terraform destroy -auto-approve
+        
+  terraform:
+    name: Terraform Deploy
+    runs-on: ubuntu-latest
+    needs: remote-backend
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform
+        run: terraform init
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        continue-on-error: false
+
+      - name: Run Terraform Plan
+        run: terraform plan
+      
+      - name: Terraform Apply
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: terraform apply -auto-approve || echo "Ignoring existing resources error"
+      
+      - name: Terraform Destroy
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: |
+          terraform destroy -auto-approve
+          echo "Terraform Destroy executed. Stopping workflow..."
+          exit 1
+      
+  update-frontend-config:
+    name: Update Frontend API Config
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform
+        working-directory: platform
+        run: terraform init
+
+      - name: Debug Terraform Outputs
+        working-directory: platform
+        run: |
+          echo "🔍 Retrieving Raw Terraform Outputs..."
+          terraform output > terraform_outputs.txt
+          cat terraform_outputs.txt
+      
+      - name: Get Terraform Output for API Domain
+        id: get_api_domain
+        working-directory: platform
+        run: |
+          #!/bin/bash
+
+          echo "🔍 Retrieving API domain from Terraform..."
+
+          # Step 1: Get the raw output and extract just the quoted value
+          RAW_OUTPUT=$(terraform output api_domain_name)
+          echo "📝 Raw output:"
+          echo "$RAW_OUTPUT"
+
+          # Step 2: Extract the quoted domain (looking for pattern "domain.com")
+          API_URL=$(echo "$RAW_OUTPUT" | grep -o '"[^"]*"' | head -n1 | tr -d '"')
+
+          # Step 3: Validate we got a domain
+          if [[ ! "$API_URL" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+              echo "❌ Error: Could not extract valid domain from output"
+              echo "Extracted value: '$API_URL'"
+              exit 1
+          fi
+
+          echo "✅ Successfully extracted API_URL: '$API_URL'"
+          echo "API_URL=${API_URL}" >> $GITHUB_ENV
+  
+      - name: Replace API_URL in configs.tsx
+        working-directory: frontend
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "❌ Error: API_URL is empty. Exiting."
+            exit 1
+          fi
+      
+          # Ensure API_URL starts with "https://"
+          if [[ ! "$API_URL" =~ ^https?:// ]]; then
+            API_URL="https://$API_URL"
+          fi
+      
+          echo "🔹 Updating API_URL in configs.tsx"
+      
+          # Escape slashes and special characters before replacing
+          SAFE_API_URL=$(echo "$API_URL" | sed 's/[\/&]/\\&/g')
+      
+          # Replace the existing API_URL in the file
+          sed -i "s|export const API_URL = \".*\";|export const API_URL = \"$SAFE_API_URL\";|" src/configs/configs.tsx
+
+          echo "✅ API_URL successfully updated: $SAFE_API_URL"
+
+          echo "🔍 Final file content:"
+          cat src/configs/configs.tsx 
+             
+      - name: Commit and Push Changes
+        working-directory: frontend 
+        run: |
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+          echo "🔍 Checking Git Status Before Commit:"
+          git status
+          git diff
+
+          git add src/configs/configs.tsx
+          git commit -m "Update API URL in frontend config" || echo "No changes to commit"
+          
+          echo "🚀 Pushing Changes to Remote Repo"
+          git push main --force || echo "No changes to push"
+
+      - name: Verify API_URL after Push
+        working-directory: frontend
+        run: |
+          echo "🔄 Fetching latest changes to verify update..."
+          git fetch origin main
+          git checkout main
+          git pull origin main
+
+          echo "🔍 Checking API_URL in configs.tsx"
+
+          # Read the API_URL from the file
+          FILE_API_URL=$(grep -oP 'export const API_URL = "\K[^"]+' src/configs/configs.tsx)
+
+          # Normalize API_URL by ensuring it starts with "https://"
+          if [[ ! "$API_URL" =~ ^https?:// ]]; then
+            EXPECTED_API_URL="https://$API_URL"
+          else
+            EXPECTED_API_URL="$API_URL"
+          fi
+
+          echo "🔹 Expected API_URL: $EXPECTED_API_URL"
+          echo "🔹 Found API_URL in configs.tsx: $FILE_API_URL"
+
+          # Compare with the expected API_URL from the workflow environment
+          if [[ "$FILE_API_URL" == "$EXPECTED_API_URL" ]]; then
+            echo "✅ API_URL was successfully updated and pushed."
+          else
+            echo "❌ API_URL update was not pushed successfully! Expected: $EXPECTED_API_URL, Found: $FILE_API_URL"
+            exit 1
+          fi
+
+
+  build-and-deploy-frontend:
+    name: Build & Deploy Frontend to S3
+    runs-on: ubuntu-latest
+    needs: update-frontend-config
+    defaults:
+      run:
+        working-directory: frontend 
+    steps:
+      - name: Checkout Code 
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "latest"
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Cleanup Old Build Files
+        run: rm -rf dist/
+
+      - name: Build Frontend
+        run: npm run build
+
+      - name: Verify Build Directory
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "Error: 'dist/' directory not found. This means the frontend build failed!"
+            exit 1
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform and Get S3 Bucket Name
+        working-directory: platform
+        run: |
+          # Initialize Terraform
+          echo "🔹 Initializing Terraform..."
+          terraform init -input=false
+          
+          # List all outputs for debugging
+          echo "🔹 Available Terraform outputs:"
+          terraform output
+          
+          # Find bucket output using grep
+          echo "🔹 Searching for S3 bucket output..."
+          BUCKET_NAME=$(terraform output | grep -i "bucket" | head -n1 | awk '{print $3}' | tr -d '"')
+          
+          if [ -z "$BUCKET_NAME" ]; then
+            echo "❌ Error: Could not find S3 bucket in Terraform outputs"
+            exit 1
+          fi
+          
+          echo "S3_BUCKET=$BUCKET_NAME" >> "$GITHUB_ENV"
+          echo "✅ Successfully found S3 bucket name: $BUCKET_NAME"
+
+      - name: Deploy Frontend to S3
+        run: |
+          if [ -z "$S3_BUCKET" ]; then
+            echo "❌ Error: S3_BUCKET environment variable is not set"
+            exit 1
+          fi
+          
+          echo "🚀 Deploying frontend to S3 bucket: $S3_BUCKET"
+          aws s3 sync dist/ s3://$S3_BUCKET --delete
+      
+        
