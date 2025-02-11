@@ -20,7 +20,7 @@ region = os.environ.get("AWS_REGION")
 session = boto3.Session(region_name=region)
 
 dynamodb = session.resource("dynamodb")
-table = dynamodb.Table("projects")
+table = dynamodb.Table("projects") # The name of the table we will create in DynamoDB
 
 # Configure CORS
 origins = [
