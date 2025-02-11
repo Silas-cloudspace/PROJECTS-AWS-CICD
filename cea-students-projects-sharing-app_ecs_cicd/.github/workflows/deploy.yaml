@@ -18,6 +18,17 @@ env:
   IMAGE_TAG: "latest"  
 
 jobs:
+  configure_aws_credentials: 
+    name: Configure AWS credentials
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
   build-and-push-docker:
     name: Build and Push Docker Image to ECR
     runs-on: ubuntu-latest
