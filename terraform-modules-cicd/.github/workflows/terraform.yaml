@@ -1,0 +1,324 @@
+name: Deploy Infrastructure and Application
+
+on:
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+
+permissions:
+  contents: write
+  
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  TERRAFORM_ACTION: "destroy" # Replace it with "destroy" to destroy the infrastructure 
+
+jobs:
+  set-environment:
+    name: Set Environment Variables
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      branch: ${{ steps.set-env.outputs.branch }}
+    steps:
+      - name: Set environment based on branch
+        id: set-env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "branch=main" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "branch=dev" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "branch=staging" >> $GITHUB_OUTPUT
+          else
+            echo "Unknown branch, defaulting to dev"
+            echo "environment=dev" >> $GITHUB_OUTPUT
+            echo "branch=dev" >> $GITHUB_OUTPUT
+          fi  
+
+  configure_aws_credentials: 
+    name: Configure AWS credentials
+    runs-on: ubuntu-latest
+    needs: set-environment
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+  remote-backend:
+    name: Remote Backend Setup
+    runs-on: ubuntu-latest
+    needs: configure_aws_credentials
+    defaults:
+      run:
+        working-directory: state-backend
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform Backend
+        run: terraform init
+      
+      - name: Terraform Apply
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: terraform apply -auto-approve || echo "Ignoring existing resources error"
+
+      - name: Terraform Destroy
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: terraform destroy -auto-approve
+        
+  terraform:
+    name: Terraform Deploy
+    runs-on: ubuntu-latest
+    needs: [remote-backend, set-environment]
+    defaults:
+      run:
+        working-directory: infrastructure
+    outputs:
+      api_domain_name: ${{ steps.terraform_outputs.outputs.api_domain_name }}
+      s3_bucket: ${{ steps.terraform_outputs.outputs.s3_bucket }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform
+        run: terraform init
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        continue-on-error: false
+
+      - name: Run Terraform Plan
+        run: terraform plan -var-file="${{ needs.set-environment.outputs.environment }}.tfvars"
+      
+      - name: Terraform Apply
+        if: env.TERRAFORM_ACTION == 'apply'
+        run: terraform apply -var-file="${{ needs.set-environment.outputs.environment }}.tfvars" -auto-approve || echo "Ignoring existing resources error"
+      
+      - name: Terraform Destroy
+        if: env.TERRAFORM_ACTION == 'destroy'
+        run: |
+          terraform destroy -var-file="${{ needs.set-environment.outputs.environment }}.tfvars" -auto-approve
+          echo "Terraform Destroy executed. Stopping workflow..."
+          exit 1
+      
+  update-frontend-config:
+    name: Update Frontend API Config
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ needs.set-environment.outputs.branch }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform
+        working-directory: infrastructure
+        run: terraform init
+
+      - name: Debug Terraform Outputs
+        working-directory: infrastructure
+        run: |
+          echo "Retrieving Raw Terraform Outputs..."
+          terraform output > terraform_outputs.txt
+          cat terraform_outputs.txt
+      
+      - name: Get Terraform Output for API Domain
+        id: get_api_domain
+        working-directory: infrastructure
+        run: |
+          #!/bin/bash
+
+          echo "Retrieving API domain from Terraform..."
+
+          # Step 1: Get the raw output and extract just the quoted value
+          RAW_OUTPUT=$(terraform output api_domain_name)
+          echo "Raw output:"
+          echo "$RAW_OUTPUT"
+
+          # Step 2: Extract the quoted domain (looking for pattern "domain.com")
+          API_URL=$(echo "$RAW_OUTPUT" | grep -o '"[^"]*"' | head -n1 | tr -d '"')
+
+          # Step 3: Validate we got a domain
+          if [[ ! "$API_URL" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+              echo "Error: Could not extract valid domain from output"
+              echo "Extracted value: '$API_URL'"
+              exit 1
+          fi
+
+          echo "Successfully extracted API_URL: '$API_URL'"
+          echo "API_URL=${API_URL}" >> $GITHUB_ENV
+  
+      - name: Replace API_URL in configs.tsx
+        working-directory: frontend
+        id: update_api_url 
+        run: |
+          if [ -z "$API_URL" ]; then
+            echo "Error: API_URL is empty. Exiting."
+            exit 1
+          fi
+        
+          # Ensure API_URL starts with "https://"
+          if [[ ! "$API_URL" =~ ^https?:// ]]; then
+            API_URL="https://$API_URL"
+          fi
+        
+          echo "Updating API_URL in configs.tsx"
+          
+          # Save the final URL to use in later steps
+          echo "FINAL_API_URL=$API_URL" >> $GITHUB_ENV
+      
+          # Escape slashes and special characters before replacing
+          SAFE_API_URL=$(echo "$API_URL" | sed 's/[\/&]/\\&/g')
+      
+          # Replace the existing API_URL in the file
+          sed -i "s|export const API_URL = \".*\";|export const API_URL = \"$SAFE_API_URL\";|" src/configs/configs.tsx
+
+          echo "API_URL successfully updated: $SAFE_API_URL"
+
+          echo "Final file content:"
+          cat src/configs/configs.tsx 
+             
+      - name: Commit and Push Changes
+        working-directory: frontend 
+        run: |
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+          git add src/configs/configs.tsx
+          git commit -m "Update API URL in frontend config" || echo "No changes to commit"
+          
+          CURRENT_BRANCH="${{ needs.set-environment.outputs.branch }}"
+          echo "Pushing Changes to Remote Repo"
+          git push main --force || echo "No changes to push"
+
+      - name: Verify API_URL after Push
+        working-directory: frontend
+        run: |
+          run: |
+            CURRENT_BRANCH="${{ needs.set-environment.outputs.branch }}"
+            
+            echo "Fetching latest changes to verify update..."
+            git fetch origin $CURRENT_BRANCH
+            git checkout $CURRENT_BRANCH
+            git pull origin $CURRENT_BRANCH
+
+            echo "Checking API_URL in configs.tsx"
+
+            # Read the API_URL from the file
+            FILE_API_URL=$(grep -oP 'export const API_URL = "\K[^"]+' src/configs/configs.tsx)
+
+            echo "Expected API_URL: $FINAL_API_URL"
+            echo "Found API_URL in configs.tsx: $FILE_API_URL"
+
+            # Compare with the expected API_URL
+            if [[ "$FILE_API_URL" == "$FINAL_API_URL" ]]; then
+              echo "API_URL was successfully updated and pushed."
+            else
+              echo "API_URL update was not pushed successfully! Expected: $FINAL_API_URL, Found: $FILE_API_URL"
+              exit 1
+            fi
+
+  build-and-deploy-frontend:
+    name: Build & Deploy Frontend to S3
+    runs-on: ubuntu-latest
+    needs: update-frontend-config
+    defaults:
+      run:
+        working-directory: frontend 
+    steps:
+      - name: Checkout Code 
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.set-environment.outputs.branch }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "latest"
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Cleanup Old Build Files
+        run: rm -rf dist/
+
+      - name: Build Frontend
+        run: npm run build
+
+      - name: Verify Build Directory
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "Error: 'dist/' directory not found. This means the frontend build failed!"
+            exit 1
+          fi
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Initialize Terraform and Get S3 Bucket Name
+        working-directory: infrastructure
+        run: |
+          # Initialize Terraform
+          echo "Initializing Terraform..."
+          terraform init -input=false
+          
+          # List all outputs for debugging
+          echo "Available Terraform outputs:"
+          terraform output
+          
+          # Find bucket output using grep
+          echo "Searching for S3 bucket output..."
+          BUCKET_NAME=$(terraform output | grep -i "bucket" | head -n1 | awk '{print $3}' | tr -d '"')
+          
+          if [ -z "$BUCKET_NAME" ]; then
+            echo "Error: Could not find S3 bucket in Terraform outputs"
+            exit 1
+          fi
+          
+          echo "S3_BUCKET=$BUCKET_NAME" >> "$GITHUB_ENV"
+          echo "Successfully found S3 bucket name: $BUCKET_NAME"
+
+      - name: Deploy Frontend to S3
+        run: |
+          if [ -z "$S3_BUCKET" ]; then
+            echo "Error: S3_BUCKET environment variable is not set"
+            exit 1
+          fi
+          
+          echo "Deploying frontend to S3 bucket: $S3_BUCKET"
+          aws s3 sync dist/ s3://$S3_BUCKET --delete
+      
+        
